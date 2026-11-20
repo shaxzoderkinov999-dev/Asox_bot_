@@ -16,7 +16,7 @@ class _DocRef:
         self._store = store
         self._coll = coll
         self.id = doc_id
-    def get(self):
+    def get(self, transaction=None):
         self._store.calls.append(("get", self._coll, self.id))
         self._store.block()
         return _Doc(self.id, self._store.data[self._coll].get(self.id))
@@ -32,6 +32,10 @@ class _DocRef:
         if self.id not in self._store.data[self._coll]:
             raise KeyError("NotFound")
         self._store.data[self._coll][self.id].update(payload)
+    def collection(self, name):
+        # Subkolleksiya (`shops/{id}/couriers`) — to'liq yo'l kalit sifatida
+        # ishlatiladi, ya'ni test seed'ida "shops/s1/couriers" deb yoziladi.
+        return _Query(self._store, f"{self._coll}/{self.id}/{name}")
 
 class _Query:
     def __init__(self, store, coll, preds=None, limit=None, order=None, desc=False):
@@ -68,6 +72,30 @@ class _Query:
             rows = rows[: self._limit]
         return [_Doc(k, v) for k, v in rows]
 
+class _Transaction:
+    """Firestore tranzaksiyasining soxta o'rnini bosuvchi.
+
+    Haqiqiy tranzaksiya kabi izolyatsiya bermaydi — testlar ketma-ket
+    chaqiruvlarni tekshiradi (birinchi kuryer yutadi, ikkinchisi
+    "kechikdingiz" oladi), parallel ijroni emas. `is_fake` bayrog'i
+    database/db.py ga haqiqiy `@transactional` bezovchisini o'tkazib
+    yuborishni bildiradi.
+    """
+    is_fake = True
+
+    def __init__(self, store):
+        self._store = store
+
+    def get(self, doc_ref):
+        return doc_ref.get()
+
+    def set(self, doc_ref, payload, merge=False):
+        doc_ref.set(payload, merge=merge)
+
+    def update(self, doc_ref, payload):
+        doc_ref.update(payload)
+
+
 class FakeFirestore:
     """`collection()` chaqiruvlarini qo'llab-quvvatlaydi; har bir I/O `block_ms` kutadi."""
     def __init__(self, data=None, block_ms=0.0):
@@ -82,3 +110,4 @@ class FakeFirestore:
         if self.block_ms:
             threading.Event().wait(self.block_ms)   # bloklovchi (async emas) kutish
     def collection(self, name): return _Query(self, name)
+    def transaction(self): return _Transaction(self)

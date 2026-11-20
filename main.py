@@ -8,7 +8,7 @@ from aiogram.enums import ParseMode
 from aiohttp import web
 
 from config import ADMIN_BOT_TOKEN, BOT_TOKEN, ENVIRONMENT, PORT
-from handlers import admin, cart, catalog, errors, start
+from handlers import admin, cart, catalog, courier, errors, start
 from middlewares import setup_throttling
 
 # Setup logging
@@ -81,6 +81,7 @@ async def main():
         dp_user.include_router(start.router)
         dp_user.include_router(catalog.router)
         dp_user.include_router(cart.router)
+        dp_user.include_router(courier.router)
         errors.setup_errors(dp_user)
         setup_throttling(dp_user)
         polling_tasks.append(safe_start_polling(bot_user, dp_user, "ASOX Market User Bot (@AsoxUz_Bot)"))

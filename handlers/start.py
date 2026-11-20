@@ -223,6 +223,70 @@ async def _handle_shop_link(
     )
 
 
+# Taklif rad etilganda ko'rsatiladigan sabablar. HAR BIRI BOSHQACHA: "havola
+# ishlamadi" degan yagona xabar bilan kuryer ham, do'kon ham nima qilishni
+# bilmasdi.
+_COURIER_INVITE_ERRORS = {
+    "not_found": (
+        "\u274c Bu havola yaroqsiz.\n\n"
+        "Do'kondan yangi havola so'rang."
+    ),
+    "used": (
+        "\u2139\ufe0f Bu havola allaqachon ishlatilgan.\n\n"
+        "Agar bu siz bo'lmasangiz, do'konga xabar bering."
+    ),
+    "expired": (
+        "\u23f0 Havolaning muddati tugagan.\n\n"
+        "Do'kondan yangi havola so'rang."
+    ),
+    "unavailable": (
+        "\u26a0\ufe0f Hozir bog'lab bo'lmadi. Birozdan keyin qayta urinib ko'ring."
+    ),
+}
+
+
+async def _handle_courier_invite(
+    message: Message, payload: str, user_id: int, username: str | None
+) -> None:
+    """`/start cour_<token>` — do'kon qo'shgan kuryerni chatga bog'laydi.
+
+    NEGA HAVOLA KERAK: Telegram boti odamga @username orqali yoza olmaydi,
+    faqat `chat_id` orqali — u esa odam Start bosgandagina paydo bo'ladi.
+    Do'kon admin paneli ism va telefonni biladi, `chat_id` ni esa bilmaydi;
+    shu bo'shliqni havola yopadi.
+
+    Token IMZOLANMAGAN, chunki bu yerda tekshiriladigan hujjatning O'ZI bor
+    (`courier_invites/{token}`): u 192-bitlik tasodifiy qiymat, bir martalik
+    va muddatli. Do'kon havolasida (`shop_<id>_<imzo>`) imzo kerak edi —
+    u yerda `shopId` ni har kim taxmin qila olardi.
+    """
+    token = payload[len("cour_"):].strip()
+    if not token:
+        await message.answer(_COURIER_INVITE_ERRORS["not_found"], parse_mode="HTML")
+        return
+
+    result = await db.redeem_courier_invite(token, user_id, username)
+    error = result.get("error")
+    if error:
+        logger.warning("Kuryer taklifi rad etildi (%s): user=%s", error, user_id)
+        await message.answer(
+            _COURIER_INVITE_ERRORS.get(error, _COURIER_INVITE_ERRORS["not_found"]),
+            parse_mode="HTML",
+        )
+        return
+
+    shop_name = result.get("shopName") or "Do'kon"
+    logger.info("Kuryer %s -> do'kon %s ga bog'landi", user_id, result.get("shopId"))
+    await message.answer(
+        f"\U0001f389 <b>{html.escape(str(shop_name))}</b> sizni kuryer sifatida qo'shdi.\n\n"
+        "Endi shu do'konning zakaslari shu chatga keladi. Zakas ma'qul bo'lsa "
+        "<b>\u2705 Qabul qildim</b> tugmasini bosing \u2014 kim birinchi bossa, "
+        "zakas o'shaniki bo'ladi.",
+        reply_markup=get_main_keyboard(),
+        parse_mode="HTML",
+    )
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, command: CommandObject = None):
     await state.clear()
@@ -235,6 +299,11 @@ async def cmd_start(message: Message, state: FSMContext, command: CommandObject 
     # Sotuvchi do'konini ulash uchun kirgan bo'lsa: /start shop_<id>_<imzo>
     if command and command.args and command.args.startswith("shop_"):
         await _handle_shop_link(message, command.args, user_id, username)
+        return
+
+    # Do'kon admin paneli qo'shgan kuryer bo'lsa: /start cour_<token>
+    if command and command.args and command.args.startswith("cour_"):
+        await _handle_courier_invite(message, command.args, user_id, username)
         return
 
     welcome_text = (

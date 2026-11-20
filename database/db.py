@@ -6,6 +6,8 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
+from utils.courier_claim import advance_decision, claim_decision
+
 logger = logging.getLogger(__name__)
 
 FIREBASE_PROJECT_ID = "asox-market-prod-2e4bb"
@@ -93,6 +95,16 @@ except Exception as _e:
     _db_client = None
     logger.warning("⚠️ Firestore ulanmadi: %s. %s", _e, IN_MEMORY_NOTICE)
 
+
+
+# `@firestore.transactional` bezovchisi haqiqiy SDK tranzaksiya obyektini
+# talab qiladi. Testlardagi soxta klient bunday obyektni bermaydi, shuning
+# uchun bezovchi faqat haqiqiy tranzaksiyaga qo'llanadi (`is_fake` bayrog'i).
+try:
+    from firebase_admin import firestore as _firestore_mod
+    _transactional = _firestore_mod.transactional
+except Exception:  # pragma: no cover - firebase_admin o'rnatilmagan muhit
+    _transactional = None
 
 
 try:  # firebase-admin >= 6.2 / google-cloud-firestore >= 2.11
@@ -756,6 +768,387 @@ class Database:
         except Exception as e:
             logger.error("Kuryer arizasini yaratishda xato: %s", e)
             return req_id, False
+
+
+
+    # ------------------------------------------------------------------
+    # Kuryerlar
+    # ------------------------------------------------------------------
+    # Hujjat ID si sifatida kuryerning Telegram chat ID si ishlatiladi:
+    # bitta Telegram akkaunt = bitta kuryer, shu sababli takroriy tasdiqlash
+    # yangi hujjat yaratmaydi, va callback kelganda couriers/{from_user.id}
+    # bo'yicha to'g'ridan-to'g'ri topiladi — qidiruv so'rovi kerak emas.
+
+    def _sync_get_doc(self, collection: str, doc_id: str) -> dict[str, Any] | None:
+        snap = _db_client.collection(collection).document(doc_id).get()
+        if not snap.exists:
+            return None
+        return {**(snap.to_dict() or {}), "id": snap.id}
+
+    def _sync_create_courier(self, courier_id: str, data: dict[str, Any]) -> None:
+        # Qayta tasdiqlashda ish tarixi yo'qolmasligi kerak: mavjud hujjatning
+        # activeOrderId va completedCount qiymatlari saqlanadi, createdAt esa
+        # qaytadan yozilmaydi.
+        doc_ref = _db_client.collection("couriers").document(courier_id)
+        existing = doc_ref.get()
+        base = {
+            "isActive": True,
+            "activeOrderId": None,
+            "completedCount": 0,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+        }
+        if existing.exists:
+            current = existing.to_dict() or {}
+            base["activeOrderId"] = current.get("activeOrderId")
+            base["completedCount"] = current.get("completedCount", 0)
+            base.pop("createdAt")
+        doc_ref.set({**data, **base}, merge=True)
+
+    async def approve_courier_request(self, req_id: str) -> dict[str, Any] | None:
+        """Arizani kuryerga aylantiradi.
+
+        Tartib MUHIM: avval `couriers` hujjati yaratiladi, keyingina ariza
+        statusi `approved` ga o'tadi. Teskarisi bo'lsa hujjat yaratilmay
+        qolganda ariza "tasdiqlangan" ko'rinib turardi, kuryer esa hech
+        qachon zakas olmasdi — jimgina yo'qoladigan xatoning aynan o'zi.
+
+        Yaratilgan kuryerni (`id` maydoni bilan) yoki `None` qaytaradi.
+        """
+        if not _db_client:
+            logger.warning("Kuryer arizasi %s tasdiqlanmadi: Firestore yo'q", req_id)
+            return None
+        try:
+            req = await _in_thread(self._sync_get_doc, "courier_requests", req_id)
+            if not req:
+                logger.warning("Kuryer arizasi %s topilmadi", req_id)
+                return None
+
+            # `userId` — arizani topshirgan Telegram foydalanuvchi ID si
+            # (handlers/start.py:550 da yoziladi). Usiz kuryerga xabar
+            # yuborib bo'lmaydi, demak hujjat ham yaratilmaydi.
+            chat_id = str(req.get("userId") or "").strip()
+            if not chat_id:
+                logger.error(
+                    "Kuryer arizasi %s da userId yo'q — hujjat yaratilmadi", req_id
+                )
+                return None
+
+            courier = {
+                "fullName": req.get("fullName") or "Kuryer",
+                "phoneNumber": req.get("phoneNumber") or "",
+                "telegramChatId": chat_id,
+                "telegramUsername": req.get("telegramUsername") or "",
+                "vehicle": req.get("vehicle") or "",
+                "city": req.get("city") or "",
+                "requestId": req_id,
+            }
+            await _in_thread(self._sync_create_courier, chat_id, courier)
+            await _in_thread(
+                self._sync_update_request, "courier_requests", req_id, "approved"
+            )
+            return {**courier, "id": chat_id}
+        except Exception as e:
+            logger.error("Kuryer arizasi %s ni tasdiqlashda xato: %s", req_id, e)
+            return None
+
+    async def get_courier(self, chat_id: str | int) -> dict[str, Any] | None:
+        if not _db_client:
+            return None
+        try:
+            return await _in_thread(self._sync_get_doc, "couriers", str(chat_id))
+        except Exception as e:
+            logger.error("Kuryer %s ni olishda xato: %s", chat_id, e)
+            return None
+
+    def _sync_redeem_courier_invite(
+        self, token: str, chat_id: str, username: str | None
+    ) -> dict[str, Any]:
+        """`courier_invites/{token}` ni kuryerga aylantiradi.
+
+        Taklifni do'kon admin paneli yaratadi (`functions/shop_couriers.js`) —
+        do'kon ism va telefonni biladi, lekin Telegram `chat_id` sini BILMAYDI:
+        bot odamga @username orqali yoza olmaydi, chat faqat odam Start
+        bosgandan keyin paydo bo'ladi. Shu bo'shliqni aynan mana shu funksiya
+        yopadi.
+
+        Tartib MUHIM: avval `couriers` hujjati, keyin ko'zgu, eng oxirida
+        taklif yopiladi. Teskarisi bo'lsa taklif "ishlatilgan" ko'rinib,
+        kuryer esa hech qachon zakas olmasdi (`approve_courier_request` dagi
+        bilan bir xil mulohaza).
+        """
+        invite_ref = _db_client.collection("courier_invites").document(token)
+        snap = invite_ref.get()
+        if not snap.exists:
+            return {"error": "not_found"}
+
+        invite = snap.to_dict() or {}
+        if invite.get("usedAt"):
+            return {"error": "used"}
+
+        expires_at = invite.get("expiresAt")
+        if expires_at is not None:
+            try:
+                now = datetime.now(expires_at.tzinfo)
+                if expires_at < now:
+                    return {"error": "expired"}
+            except (AttributeError, TypeError):
+                # Buzilgan sana — taklifni rad etamiz (fail-closed).
+                logger.error("Taklif %s da expiresAt buzilgan: %r", token, expires_at)
+                return {"error": "expired"}
+
+        shop_id = str(invite.get("shopId") or "").strip()
+        if not shop_id:
+            logger.error("Taklif %s da shopId yo'q", token)
+            return {"error": "not_found"}
+
+        # 1) Kanonik kuryer hujjati. `source: 'shop'` — do'kon havolasi orqali
+        # kelgan kuryer; usiz do'kon uni o'chirganda `shopIds` bo'shab qolardi
+        # va u umumiy havzaga tushib BARCHA do'konlarning zaxira zakaslarini
+        # ola boshlardi (`courier_dispatch.js:selectCouriers`).
+        #
+        # MAVJUD kuryerga `source` YOZILMAYDI: markaziy admin tasdiqlagan
+        # platforma kuryeri do'kon havolasini ochsa (telefoni boshqacha
+        # yozilgani uchun panel uni topa olmagan bo'lishi mumkin), uni
+        # do'konga qulflab qo'yish — huquqni pasaytirish bo'lardi.
+        courier_data = {
+            "fullName": invite.get("fullName") or "Kuryer",
+            "phoneNumber": invite.get("phoneNumber") or "",
+            "phoneE164": invite.get("phoneE164") or "",
+            "telegramChatId": chat_id,
+            "telegramUsername": username or "",
+            # `vehicle` — admin botidagi kuryerlar ro'yxati shu maydonni
+            # chiqaradi; `vehicleType` — Flutter modeli o'qiydigan kod.
+            "vehicle": invite.get("vehicleType") or "",
+            "vehicleType": invite.get("vehicleType") or "",
+            "city": invite.get("city") or "",
+            "shopIds": firestore.ArrayUnion([shop_id]),
+        }
+        if not _db_client.collection("couriers").document(chat_id).get().exists:
+            courier_data["source"] = "shop"
+        self._sync_create_courier(chat_id, courier_data)
+
+        # 2) Do'kon paneli ko'zgusi.
+        mirror_id = str(invite.get("mirrorDocId") or "").strip()
+        if mirror_id:
+            (
+                _db_client.collection("shops")
+                .document(shop_id)
+                .collection("couriers")
+                .document(mirror_id)
+                .set(
+                    {
+                        "courierId": chat_id,
+                        "status": "active",
+                        "telegramUsername": username or "",
+                        "joinedAt": firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+            )
+
+        # 3) Taklif bir martalik.
+        invite_ref.set(
+            {"usedAt": firestore.SERVER_TIMESTAMP, "usedBy": chat_id}, merge=True
+        )
+
+        return {
+            "shopId": shop_id,
+            "shopName": invite.get("shopName") or "",
+            "fullName": invite.get("fullName") or "",
+        }
+
+    async def redeem_courier_invite(
+        self, token: str, chat_id: str | int, username: str | None = None
+    ) -> dict[str, Any]:
+        """`/start cour_<token>` uchun. Xato bo'lsa `{'error': ...}` qaytaradi."""
+        if not _db_client:
+            logger.warning("Taklif %s qabul qilinmadi: Firestore yo'q", token)
+            return {"error": "unavailable"}
+        try:
+            return await _in_thread(
+                self._sync_redeem_courier_invite, token, str(chat_id), username
+            )
+        except Exception as e:
+            logger.error("Taklif %s ni qabul qilishda xato: %s", token, e)
+            return {"error": "unavailable"}
+
+
+
+    def _run_in_transaction(self, body):
+        """`body(txn)` ni tranzaksiya ichida bajaradi.
+
+        Haqiqiy klientda `@firestore.transactional` konflikt bo'lganda
+        avtomatik qayta uriniladi — aynan shu bizga kerak: ikki kuryer bir
+        vaqtda bosganda ikkinchisi yangilangan hujjatni qayta o'qiydi va
+        "taken" qarorini oladi.
+        """
+        txn = _db_client.transaction()
+        if _transactional is not None and not getattr(txn, "is_fake", False):
+            return _transactional(body)(txn)
+        return body(txn)
+
+    def _sync_claim_order(self, order_id: str, courier: dict[str, Any]) -> str:
+        order_ref = _db_client.collection("orders").document(order_id)
+        courier_id = str(courier.get("id") or courier.get("telegramChatId") or "")
+        courier_ref = _db_client.collection("couriers").document(courier_id)
+
+        def _body(txn) -> str:
+            snap = order_ref.get(transaction=txn)
+            order = snap.to_dict() if snap.exists else None
+            decision = claim_decision(order)
+            if decision != "won":
+                return decision
+            txn.update(order_ref, {
+                "courierStatus": "accepted",
+                "courierId": courier_id,
+                "courierName": courier.get("fullName") or "",
+                "courierPhone": courier.get("phoneNumber") or "",
+                "courierChatId": courier_id,
+                "courierAcceptedAt": firestore.SERVER_TIMESTAMP,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            })
+            txn.update(courier_ref, {"activeOrderId": order_id})
+            return "won"
+
+        return self._run_in_transaction(_body)
+
+    async def claim_order_for_courier(
+        self, order_id: str, courier: dict[str, Any] | None
+    ) -> str:
+        """Zakasni kuryerga biriktiradi. `"won"` / `"taken"` / `"not_found"`.
+
+        Poyga aynan shu yerda hal bo'ladi: tranzaksiya atomik, shu sababli
+        ikkinchi bosgan kuryer qancha tez bo'lmasin, o'qiganida
+        `courierStatus` allaqachon `accepted` bo'ladi.
+        """
+        if not _db_client or not courier:
+            return "not_found"
+        try:
+            return await _in_thread(self._sync_claim_order, order_id, courier)
+        except Exception as e:
+            logger.error("Zakas %s ni biriktirishda xato: %s", order_id, e)
+            return "not_found"
+
+    def _sync_advance_order(
+        self,
+        order_id: str,
+        courier_id: str,
+        expected: str,
+        courier_status: str,
+        order_status: str,
+    ) -> str:
+        order_ref = _db_client.collection("orders").document(order_id)
+        courier_ref = _db_client.collection("couriers").document(str(courier_id))
+
+        # Holat -> yozib qo'yiladigan vaqt tamg'asi maydoni.
+        stamp_field = {
+            "picked_up": "courierPickedUpAt",
+            "delivered": "courierDeliveredAt",
+        }.get(courier_status)
+
+        def _body(txn) -> str:
+            snap = order_ref.get(transaction=txn)
+            order = snap.to_dict() if snap.exists else None
+            decision = advance_decision(order, courier_id, expected)
+            if decision != "ok":
+                return decision
+            payload = {
+                "courierStatus": courier_status,
+                "status": order_status,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }
+            if stamp_field:
+                payload[stamp_field] = firestore.SERVER_TIMESTAMP
+            txn.update(order_ref, payload)
+
+            # Yetkazilgach kuryer bo'shaydi va hisobi oshadi. Increment emas,
+            # o'qib-yozish: tranzaksiya ichida bu xavfsiz va soxta klient
+            # ham qo'llab-quvvatlaydi.
+            if courier_status == "delivered":
+                csnap = courier_ref.get(transaction=txn)
+                current = (csnap.to_dict() or {}) if csnap.exists else {}
+                txn.update(courier_ref, {
+                    "activeOrderId": None,
+                    "completedCount": int(current.get("completedCount") or 0) + 1,
+                })
+            return "ok"
+
+        return self._run_in_transaction(_body)
+
+    async def advance_courier_order(
+        self,
+        order_id: str,
+        courier_id: str | int,
+        expected: str,
+        courier_status: str,
+        order_status: str,
+    ) -> str:
+        """Zakas holatini oldinga suradi.
+
+        `"ok"` / `"not_found"` / `"not_yours"` / `"wrong_state"`.
+        """
+        if not _db_client:
+            return "not_found"
+        try:
+            return await _in_thread(
+                self._sync_advance_order, order_id, str(courier_id),
+                expected, courier_status, order_status,
+            )
+        except Exception as e:
+            logger.error("Zakas %s holatini o'zgartirishda xato: %s", order_id, e)
+            return "not_found"
+
+    async def get_order_raw(self, order_id: str) -> dict[str, Any] | None:
+        """Buyurtmaning XOM hujjati — `normalize_order()` siz.
+
+        Kuryer maydonlari (`courierStatus`, `courierOfferMessages`, ...)
+        normalizatsiyadan o'tmaydi, shu sababli ular kerak bo'lganda
+        `get_order_by_id()` emas, aynan shu metod ishlatiladi.
+        """
+        if not _db_client:
+            return None
+        try:
+            return await _in_thread(self._sync_get_doc, "orders", order_id)
+        except Exception as e:
+            logger.error("Zakas %s ni o'qishda xato: %s", order_id, e)
+            return None
+
+
+
+    def _sync_list_couriers(self, limit: int) -> list[dict[str, Any]]:
+        docs = _db_client.collection("couriers").limit(limit).stream()
+        return [{**(d.to_dict() or {}), "id": d.id} for d in docs]
+
+    async def list_couriers(self, limit: int = 30) -> list[dict[str, Any]]:
+        """Barcha kuryerlar — faol va o'chirilganlari bilan birga.
+
+        `isActive` bo'yicha filtrlamaydi: admin aynan o'chirilganlarini ham
+        ko'rib, kerak bo'lsa qaytadan yoqishi kerak.
+        """
+        if not _db_client:
+            return []
+        try:
+            return await _in_thread(self._sync_list_couriers, limit)
+        except Exception as e:
+            logger.error("Kuryerlar ro'yxatini olishda xato: %s", e)
+            return []
+
+    def _sync_set_courier_active(self, courier_id: str, is_active: bool) -> None:
+        _db_client.collection("couriers").document(courier_id).update({
+            "isActive": bool(is_active),
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+
+    async def set_courier_active(self, courier_id: str, is_active: bool) -> bool:
+        """Kuryerni yoqadi/o'chiradi. O'chirilganiga taklif yuborilmaydi."""
+        if not _db_client:
+            return False
+        try:
+            await _in_thread(self._sync_set_courier_active, str(courier_id), is_active)
+            return True
+        except Exception as e:
+            logger.error("Kuryer %s holatini o'zgartirishda xato: %s", courier_id, e)
+            return False
 
 
 # Global database instance
